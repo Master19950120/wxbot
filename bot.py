@@ -60,9 +60,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 添加图像生成相关常量
-IMAGE_API_URL = f"{IMAGE_URL}"  # 需要在config.py中添加基础URL
-
 # 添加临时目录初始化
 temp_dir = os.path.join(root_dir, TEMP_IMAGE_DIR)
 if not os.path.exists(temp_dir):
@@ -71,19 +68,38 @@ if not os.path.exists(temp_dir):
 
 # 保存聊天记录到数据库
 def save_message(sender_id, sender_name, message, reply):
+    """
+    将聊天消息及其回复保存到数据库中。
+
+    参数:
+    sender_id (str): 发送者的唯一标识符。
+    sender_name (str): 发送者的名称。
+    message (str): 发送者发送的消息内容。
+    reply (str): 机器人的回复内容。
+
+    过程:
+    1. 创建一个新的数据库会话。
+    2. 使用提供的参数创建一个新的 ChatMessage 对象。
+    3. 将 ChatMessage 对象添加到数据库会话中。
+    4. 提交会话以保存更改。
+    5. 关闭数据库会话以释放资源。
+
+    异常处理:
+    如果在保存过程中发生任何异常，将捕获异常并打印错误信息。
+    """
     try:
-        session = Session()
+        session = Session()  # 创建一个新的数据库会话
         chat_message = ChatMessage(
             sender_id=sender_id,
             sender_name=sender_name,
             message=message,
             reply=reply
         )
-        session.add(chat_message)
-        session.commit()
-        session.close()
+        session.add(chat_message)  # 将 ChatMessage 对象添加到会话中
+        session.commit()  # 提交会话以保存更改
+        session.close()  # 关闭会话以释放资源
     except Exception as e:
-        print(f"保存消息失败: {str(e)}")
+        print(f"保存消息失败: {str(e)}")  # 打印错误信息
 
 
 # 调用API生成图像
@@ -235,7 +251,9 @@ def get_deepseek_response(message, user_id):
             )
         except Exception as api_error:
             logger.error(f"API调用失败: {str(api_error)}")
-            return "抱歉，我现在有点累，请稍后再试..."
+            # 异步清空当前用户Id的最新一条上下文
+            threading.Thread(target=clear_latest_user_context, args=(user_id,)).start()
+            return "又瞎鸡儿给我乱发什么了 赶紧撤回!"
 
         if not response.choices:
             logger.error("API返回空choices: %s", response)
@@ -254,151 +272,272 @@ def get_deepseek_response(message, user_id):
         return "抱歉，刚刚不小心睡着了..."
 
 
-# 处理用户消息
 def process_user_messages(user_id):
+    """
+    处理来自用户的合并消息，并根据需要发送回复和保存消息记录。
+
+    参数:
+    user_id (str): 用户的唯一标识符。
+
+    过程:
+    1. 使用队列锁确保线程安全，从用户队列中获取用户数据。
+    2. 如果用户ID不在队列中，直接返回。
+    3. 从队列中移除用户数据，并提取消息列表、发送者名称和用户名。
+    4. 过滤重复消息并保留最近的5条消息，生成合并消息。
+    5. 调用 `get_deepseek_response` 函数获取API回复。
+    6. 根据API回复的内容类型（图片或文本），执行相应的发送逻辑：
+       - 如果回复包含图片标记，发送图片和附加文本消息。
+       - 如果回复包含分隔符 '\\', 分割并逐条发送消息。
+       - 否则，直接发送回复消息。
+    7. 异步保存消息记录到数据库。
+
+    异常处理:
+    如果在发送回复或保存消息记录过程中发生任何异常，将捕获异常并打印错误信息。
+    """
     with queue_lock:
         if user_id not in user_queues:
+            logger.debug(f"用户ID {user_id} 不在队列中，直接返回")
             return
-        user_data = user_queues.pop(user_id)
-        messages = user_data['messages']
-        sender_name = user_data['sender_name']
-        username = user_data['username']
+        user_data = user_queues.pop(user_id)  # 从队列中移除用户数据
+        messages = user_data['messages']  # 提取消息列表
+        sender_name = user_data['sender_name']  # 提取发送者名称
+        username = user_data['username']  # 提取用户名
 
-    # 过滤重复消息并确保合并的消息相关
+    # 过滤重复消息并保留最近的5条消息
     unique_messages = list(dict.fromkeys(messages))[-5:]  # 保留唯一消息并限制数量
-    merged_message = ' \\ '.join(unique_messages)
-    print(f"处理合并消息 ({sender_name}): {merged_message}")
+    merged_message = ' \\ '.join(unique_messages)  # 生成合并消息
+    logger.info(f"处理合并消息 ({sender_name}): {merged_message}")  # 打印合并消息
 
     # 获取API回复
-    reply = get_deepseek_response(merged_message, user_id)
+    reply = get_deepseek_response(merged_message, user_id)  # 调用API获取回复
+    logger.debug(f"API回复: {reply}")
 
-    # 修改发送逻辑部分
+    # 根据API回复的内容类型执行相应的发送逻辑
     try:
         if '[IMAGE]' in reply:
-            # 处理图片回复
-            img_path = reply.split('[IMAGE]')[1].split('[/IMAGE]')[0].strip()
-            # 确保使用临时目录
-            if os.path.exists(img_path):
-                try:
-                    # 使用SendFiles方法发送图片，注意参数名是filepath
-                    wx.SendFiles(filepath=img_path, who=user_id)
-                    # 发送附加文本消息
-                    text_msg = reply.split('[/IMAGE]')[1].strip()
-                    if text_msg:
-                        wx.SendMsg(msg=text_msg, who=user_id)
-                finally:
-                    # 删除临时图片
-                    try:
-                        os.remove(img_path)
-                    except Exception as e:
-                        logger.error(f"不好了！删除临时图片失败: {str(e)}")
+            handle_image_reply(reply, user_id)
         elif '\\' in reply:
-            parts = [p.strip() for p in reply.split('\\') if p.strip()]
-            for part in parts:
-                wx.SendMsg(msg=part, who=user_id)
-                time.sleep(random.randint(1, 2))
+            handle_text_reply(reply, user_id)
         else:
-            wx.SendMsg(msg=reply, who=user_id)
-
+            send_text_message(reply, user_id)
     except Exception as e:
-        logger.error(f"不好了！发送回复失败: {str(e)}")
+        logger.error(f"发送回复失败: {str(e)}")  # 打印错误信息
 
     # 异步保存消息记录
-    threading.Thread(target=save_message, args=(username, sender_name, merged_message, reply)).start()
+    threading.Thread(target=save_message, args=(username, sender_name, merged_message, reply)).start()  # 启动线程保存消息
 
 
-# 消息监听
+def handle_image_reply(reply, user_id):
+    """
+    处理包含图片的回复。
+
+    参数:
+    reply (str): 包含图片标记的回复。
+    user_id (str): 用户的唯一标识符。
+    """
+    try:
+        img_path = reply.split('[IMAGE]')[1].split('[/IMAGE]')[0].strip()  # 提取图片路径
+        if os.path.exists(img_path):
+            try:
+                wx.SendFiles(filepath=img_path, who=user_id)  # 发送图片
+                text_msg = reply.split('[/IMAGE]')[1].strip()  # 提取附加文本消息
+                if text_msg:
+                    send_text_message(text_msg, user_id)  # 发送文本消息
+            finally:
+                try:
+                    os.remove(img_path)  # 删除图片文件
+                except Exception as e:
+                    logger.error(f"删除临时图片失败: {str(e)}")  # 打印错误信息
+    except Exception as e:
+        logger.error(f"处理图片回复失败: {str(e)}")
+
+
+def handle_text_reply(reply, user_id):
+    """
+    处理包含分隔符 '\\', 分割并逐条发送消息。
+
+    参数:
+    reply (str): 包含分隔符 '\\', 分割并逐条发送消息。
+    user_id (str): 用户的唯一标识符。
+    """
+    try:
+        parts = [p.strip() for p in reply.split('\\') if p.strip()]  # 分割回复消息
+        for part in parts:
+            send_text_message(part, user_id)  # 发送每条消息
+            time.sleep(random.randint(1, 2))  # 随机延迟1到2秒
+    except Exception as e:
+        logger.error(f"处理文本回复失败: {str(e)}")
+
+
+def send_text_message(msg, user_id):
+    """
+    发送文本消息。
+
+    参数:
+    msg (str): 要发送的文本消息。
+    user_id (str): 用户的唯一标识符。
+    """
+    try:
+        wx.SendMsg(msg=msg, who=user_id)  # 发送文本消息
+    except Exception as e:
+        logger.error(f"发送文本消息失败: {str(e)}")
+
+
+
 def message_listener():
-    wx = None
-    last_window_check = 0
-    check_interval = 600  # 每600秒检查一次窗口状态,检查是否活动(是否在聊天界面)
+    """
+    持续监听微信消息，并根据消息类型和内容进行处理。
+
+    过程:
+    1. 初始化微信客户端对象 `wx` 为 `None`。
+    2. 设置 `last_window_check` 为 0，用于记录上一次检查微信窗口状态的时间。
+    3. 设置 `check_interval` 为 600 秒，表示每隔600秒检查一次微信窗口状态。
+    4. 进入无限循环，持续监听消息。
+    5. 获取当前时间 `current_time`。
+    6. 如果 `wx` 为 `None` 或者距离上次检查窗口状态的时间超过 `check_interval`，重新初始化微信客户端：
+       - 创建新的 `WeChat` 对象。
+       - 检查微信会话列表，如果会话列表为空，等待5秒后继续。
+       - 更新 `last_window_check` 为当前时间。
+    7. 获取监听到的消息 `msgs`。
+    8. 如果没有消息，等待 `wait` 秒后继续。
+    9. 遍历每个聊天对象 `chat`：
+       - 获取聊天对象的 `who` 属性（发送者ID）。
+       - 如果 `who` 为空，跳过该聊天对象。
+       - 获取该聊天对象的所有消息 `one_msgs`。
+       - 如果没有消息，跳过该聊天对象。
+       - 遍历每条消息 `msg`：
+         - 获取消息类型 `msgtype` 和内容 `content`。
+         - 如果消息内容为空，跳过该消息。
+         - 如果消息类型不是 'friend'（非好友消息），记录日志并跳过该消息。
+         - 如果接收窗口名与发送人相同，表示是私聊，调用 `handle_wxauto_message` 处理私聊信息。
+         - 如果消息内容中包含 `@机器人名称`，表示是群聊中@当前机器人的消息，调用 `handle_wxauto_message` 处理群聊信息。
+         - 否则，记录日志并跳过该消息。
+    10. 捕获处理单条消息时的异常，并记录日志。
+    11. 捕获整个监听循环中的异常，并记录日志，重置微信客户端对象 `wx` 为 `None`。
+    12. 每次循环结束时，等待 `wait` 秒。
+
+    异常处理:
+    如果在检查窗口状态、获取消息或处理消息过程中发生任何异常，将捕获异常并打印错误信息。
+    """
+    wx = None  # 初始化微信客户端对象为 None
+    last_window_check = 0  # 记录上一次检查微信窗口状态的时间
+    check_interval = 600  # 每600秒检查一次窗口状态
 
     while True:
         try:
-            current_time = time.time()
+            current_time = time.time()  # 获取当前时间
 
             # 只在必要时初始化或重新获取微信窗口，不输出提示
             if wx is None or (current_time - last_window_check > check_interval):
-                wx = WeChat()
+                wx = WeChat()  # 创建新的 WeChat 对象
                 if not wx.GetSessionList():
-                    time.sleep(5)
+                    time.sleep(5)  # 如果会话列表为空，等待5秒后继续
                     continue
-                last_window_check = current_time
+                last_window_check = current_time  # 更新上一次检查时间
 
+            # 获取监听到的消息
             msgs = wx.GetListenMessage()
             if not msgs:
-                time.sleep(wait)
+                time.sleep(wait)  # 如果没有消息，等待 wait 秒后继续
                 continue
 
+            # 遍历每个聊天对象
             for chat in msgs:
-                who = chat.who
+                who = chat.who  # 获取聊天对象的发送者ID
                 if not who:
-                    continue
+                    continue  # 如果发送者ID为空，跳过该聊天对象
 
+                # 获取该聊天对象的所有消息
                 one_msgs = msgs.get(chat)
                 if not one_msgs:
-                    continue
+                    continue  # 如果没有消息，跳过该聊天对象
 
+                # 遍历每条消息
                 for msg in one_msgs:
                     try:
-                        msgtype = msg.type
-                        content = msg.content
+                        msgtype = msg.type  # 获取消息类型
+                        content = msg.content  # 获取消息内容
                         if not content:
-                            continue
+                            continue  # 如果消息内容为空，跳过该消息
+
+                        # 忽略非好友消息
                         if msgtype != 'friend':
                             logger.debug(f"非好友消息，忽略! 消息类型: {msgtype}")
                             continue
-                            # 只输出实际的消息内容
+
                         # 接收窗口名跟发送人一样，代表是私聊，否则是群聊
                         if who == msg.sender:
                             handle_wxauto_message(msg, msg.sender)  # 处理私聊信息
                         elif ROBOT_WX_NAME != '' and bool(re.search(f'@{ROBOT_WX_NAME}\u2005', msg.content)):
                             handle_wxauto_message(msg, who)  # 处理群聊信息，只有@当前机器人才会处理
-                        # TODO(jett): 这里看需要要不要打日志，群聊信息太多可能日志会很多
                         else:
                             logger.debug(f"非需要处理消息，可能是群聊非@消息: {content}")
                     except Exception as e:
                         logger.debug(f"不好了！处理单条消息失败: {str(e)}")
-                        continue
+                        continue  # 捕获处理单条消息时的异常，并记录日志
 
         except Exception as e:
             logger.debug(f"不好了！消息监听出错: {str(e)}")
             wx = None  # 出错时重置微信对象
-        time.sleep(wait)
+        time.sleep(wait)  # 每次循环结束时，等待 wait 秒
+
 
 
 # 处理微信消息
 def handle_wxauto_message(msg, chatName):
     try:
+        # 获取聊天名称（用户或群聊名称）
         username = chatName
+
+        # 从消息对象中提取内容，优先使用 'content' 属性，若不存在则使用 'text' 属性
         content = getattr(msg, 'content', None) or getattr(msg, 'text', None)
-        # @消息过滤@头信息，防止机器名与prompt设定名不一致的问题
+
+        # 过滤掉消息中的特殊标记（如 '@机器人名称'），防止机器名与设定名不一致的问题
         content = content.replace(f'@{ROBOT_WX_NAME}\u2005', '')
+
+        # 如果消息内容为空，记录日志并直接返回，结束函数执行
         if not content:
             logger.debug("不好了！无法获取消息内容")
             return
 
+        # 设置发送者名称为聊天名称
         sender_name = username
+
+        # 获取当前时间，并格式化为 "年-月-日 时:分:秒" 的字符串形式
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # 将当前时间与消息内容结合，生成带时间戳的消息内容
         time_aware_content = f"[{current_time}] {content}"
 
+        # 使用线程安全的锁，确保对共享资源的操作是线程安全的
         with queue_lock:
+            # 如果用户不在消息队列中，则初始化该用户的队列和定时器
             if username not in user_queues:
-                # 减少等待时间为3秒
+                # 创建一个定时器，3秒后触发 process_user_messages 函数
                 user_queues[username] = {
                     'timer': threading.Timer(3.0, process_user_messages, args=[username]),
-                    'messages': [time_aware_content],
-                    'sender_name': sender_name,
-                    'username': username
+                    'messages': [time_aware_content],  # 初始化消息列表，包含当前消息
+                    'sender_name': sender_name,  # 发送者名称
+                    'username': username  # 用户名称
                 }
-                user_queues[username]['timer'].start()
-            else:
-                # 重置现有定时器
-                user_queues[username]['timer'].cancel()
-                user_queues[username]['messages'].append(time_aware_content)
-                user_queues[username]['timer'] = threading.Timer(5.0, process_user_messages, args=[username])
+                # 启动定时器
                 user_queues[username]['timer'].start()
 
+            # 如果用户已经在消息队列中，则更新其队列和定时器
+            else:
+                # 取消现有的定时器，避免重复触发
+                user_queues[username]['timer'].cancel()
+
+                # 将当前消息追加到用户的消息列表中
+                user_queues[username]['messages'].append(time_aware_content)
+
+                # 创建一个新的定时器，5秒后触发 process_user_messages 函数
+                user_queues[username]['timer'] = threading.Timer(5.0, process_user_messages, args=[username])
+
+                # 启动新的定时器
+                user_queues[username]['timer'].start()
+
+    # 捕获所有异常，并打印错误信息
     except Exception as e:
         print(f"消息处理失败: {str(e)}")
 
@@ -408,6 +547,13 @@ def clear_chat_contexts():
     with queue_lock:
         chat_contexts.clear()  # 清空所有用户的上下文
         logger.info("已清空所有用户的聊天上下文。")
+
+# 清空指定用户的最新一条上下文
+def clear_latest_user_context(user_id):
+    with queue_lock:
+        if user_id in chat_contexts and len(chat_contexts[user_id]) > 0:
+            chat_contexts[user_id].pop()
+            logger.info(f"已清空用户 {user_id} 的最新一条聊天上下文。")
 
 
 # 主函数
